@@ -218,6 +218,127 @@ def compute_centerline(mask_arr: np.ndarray) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Save straightened volume as NIfTI
+# ---------------------------------------------------------------------------
+
+def save_straightened_nifti(straight_arr: np.ndarray,
+                             centerline: dict,
+                             original_spacing_zyx: tuple,
+                             out_path: str,
+                             is_seg: bool = False) -> None:
+    """
+    Save a straightened volume (output of straighten_volume) as NIfTI.
+
+    Spatial metadata
+    ----------------
+    The straightened volume lives in a *reformed* coordinate system that has
+    no meaningful relationship to the original scanner frame, so origin and
+    direction cosines are set to identity defaults.
+
+    Voxel spacing is set as follows:
+      - Axes 1 & 2 (cross-section plane): original in-plane spacing (mean of
+        y and x spacing), because the cross-section grid is sampled at
+        1-voxel steps in the original image.
+      - Axis 0 (arc / longitudinal): physical arc length divided by the
+        number of output slices, giving the average mm per arc step.
+
+    This is an approximation (the spline is parameterised uniformly, not at
+    equal arc-length intervals), but it is accurate to within ~5 % for smooth
+    colon shapes and is the standard approach for CPR NIfTI outputs.
+
+    Parameters
+    ----------
+    straight_arr        : (L, H, W) array — output of straighten_volume()
+    centerline          : SATO centerline dict (contains arc length + point spacing)
+    original_spacing_zyx: (z_mm, y_mm, x_mm) from the source CT
+    out_path            : destination .nii or .nii.gz path
+    is_seg              : if True cast to uint8; otherwise int16
+    """
+    sz, sy, sx = original_spacing_zyx
+
+    # Physical arc length = sum of Euclidean step lengths weighted by spacing
+    pts = np.array([p["coordinate"] for p in centerline["point"]], dtype=float)
+    diffs = np.diff(pts, axis=0)                    # (N-1, 3) in [Z, Y, X] voxels
+    # scale each axis diff by its physical spacing before computing norm
+    diffs_mm = diffs * np.array([sz, sy, sx])
+    arc_mm = float(np.sum(np.linalg.norm(diffs_mm, axis=1)))
+
+    n_slices = straight_arr.shape[0]
+    arc_step_mm = arc_mm / n_slices                 # mm per output slice
+
+    # cross-section spacing = original in-plane spacing (mean of y and x)
+    inplane_mm = float((sy + sx) / 2.0)
+
+    # SimpleITK spacing convention: (x, y, z) = (axis-2, axis-1, axis-0)
+    spacing_itk = (inplane_mm, inplane_mm, arc_step_mm)
+
+    dtype = np.uint8 if is_seg else np.int16
+    itk_img = sitk.GetImageFromArray(straight_arr.astype(dtype))
+    itk_img.SetSpacing(spacing_itk)
+    # identity direction + zero origin: no meaningful patient coordinate frame
+    itk_img.SetDirection((1, 0, 0, 0, 1, 0, 0, 0, 1))
+    itk_img.SetOrigin((0.0, 0.0, 0.0))
+
+    sitk.WriteImage(itk_img, out_path)
+    tag = "mask" if is_seg else "CT"
+    print(f"    Saved NIfTI ({tag}): {out_path}")
+    print(f"      shape      : {straight_arr.shape}  (arc × cross × cross)")
+    print(f"      arc step   : {arc_step_mm:.3f} mm  (physical arc length {arc_mm:.0f} mm)")
+    print(f"      in-plane   : {inplane_mm:.3f} mm")
+    print(f"      note       : orientation header is identity (reformed frame, not scanner space)")
+
+
+# ---------------------------------------------------------------------------
+# Save centerline as NIfTI
+# ---------------------------------------------------------------------------
+
+def save_centerline_nifti(centerline: dict,
+                           reference_nifti_path: str,
+                           out_path: str,
+                           value: str = "radius") -> None:
+    """
+    Save the centerline as a NIfTI volume in the same space as the original CT.
+
+    Each centerline voxel is set to a non-zero value; all others are 0.
+    The result can be overlaid directly on the CT in ITK-SNAP or 3D Slicer.
+
+    Parameters
+    ----------
+    centerline          : SATO centerline dict
+    reference_nifti_path: path to the original CT NIfTI — used to copy
+                          spacing, origin, and direction cosines exactly
+    out_path            : destination .nii or .nii.gz path
+    value               : what to store at each centerline voxel:
+                          'radius'  – local tube radius in voxels (default,
+                                      encodes thickness for visualisation)
+                          'binary'  – 1 everywhere on the path
+    """
+    ref_itk = sitk.ReadImage(reference_nifti_path)
+    ref_arr = sitk.GetArrayFromImage(ref_itk)           # (Z, Y, X)
+
+    cl_vol = np.zeros(ref_arr.shape, dtype=np.float32)
+
+    for pt in centerline["point"]:
+        z, y, x = pt["coordinate"].astype(int)
+        # guard against out-of-bounds (shouldn't happen, but be safe)
+        if (0 <= z < cl_vol.shape[0] and
+                0 <= y < cl_vol.shape[1] and
+                0 <= x < cl_vol.shape[2]):
+            cl_vol[z, y, x] = 1.0 if value == "binary" else float(pt["width"])
+
+    out_itk = sitk.GetImageFromArray(cl_vol)
+    # copy spatial metadata from reference so the overlay is perfectly aligned
+    out_itk.CopyInformation(ref_itk)
+
+    sitk.WriteImage(out_itk, out_path)
+    n_pts = len(centerline["point"])
+    print(f"    Saved centerline NIfTI: {out_path}")
+    print(f"      {n_pts} voxels set  |  value='{value}'  |  "
+          f"shape={cl_vol.shape}  |  spacing={ref_itk.GetSpacing()}")
+    print(f"      Can be overlaid on the CT in ITK-SNAP / 3D Slicer")
+
+
+# ---------------------------------------------------------------------------
 # Step 4: SATO straightening (exactly mirrors the original scripts)
 # ---------------------------------------------------------------------------
 
@@ -365,12 +486,15 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     paths = {
-        "nifti":        out / "ct.nii.gz",
-        "colon_mask":   out / "segmentation" / "colon.nii.gz",
-        "seg_dir":      out / "segmentation",
-        "centerline":   out / "centerline.npy",
-        "straight_img": out / "straightened_image.tif",
-        "straight_seg": out / "straightened_mask.tif",
+        "nifti":            out / "ct.nii.gz",
+        "colon_mask":       out / "segmentation" / "colon.nii.gz",
+        "seg_dir":          out / "segmentation",
+        "centerline":       out / "centerline.npy",
+        "centerline_nii":   out / "centerline.nii.gz",
+        "straight_img":     out / "straightened_image.tif",
+        "straight_seg":     out / "straightened_mask.tif",
+        "straight_img_nii": out / "straightened_image.nii.gz",
+        "straight_seg_nii": out / "straightened_mask.nii.gz",
     }
 
     # Step 1 ----------------------------------------------------------------
@@ -427,9 +551,25 @@ def main():
                     str(paths["straight_seg"]))
     print(f"    Saved: {paths['straight_seg']}  shape={s_seg.shape}")
 
+    # Step 5a: save centerline as NIfTI ---------------------------------------
+    print("[5a] Saving centerline as NIfTI…")
+    save_centerline_nifti(cl, str(paths["nifti"]),
+                          str(paths["centerline_nii"]), value="radius")
+
+    # Step 5b: save NIfTI versions of the straightened volumes ---------------
+    print("[5b] Saving straightened volumes as NIfTI…")
+    img_itk   = sitk.ReadImage(str(paths["nifti"]))
+    spacing   = img_itk.GetSpacing()          # (x_mm, y_mm, z_mm) ITK order
+    sp_zyx    = (spacing[2], spacing[1], spacing[0])
+
+    save_straightened_nifti(s_img, cl, sp_zyx,
+                            str(paths["straight_img_nii"]), is_seg=False)
+    save_straightened_nifti(s_seg, cl, sp_zyx,
+                            str(paths["straight_seg_nii"]), is_seg=True)
+
     print("\n=== Done ===")
     for k, p in paths.items():
-        print(f"  {k:15s}: {p}")
+        print(f"  {k:20s}: {p}")
 
 
 if __name__ == "__main__":

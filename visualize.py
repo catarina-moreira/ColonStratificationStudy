@@ -1,8 +1,9 @@
 """
 Visualisation utilities for the SATO colon straightening pipeline.
 
-All functions return the matplotlib Figure so callers can call
-fig.savefig(...) or fig.show() as needed.
+Matplotlib functions return a Figure (call fig.show() or display in notebook).
+Plotly functions (plot_colon_mask_3d, plot_straightened_3d) return a
+plotly.graph_objects.Figure — call fig.show() for an interactive widget.
 """
 
 import numpy as np
@@ -374,4 +375,192 @@ def plot_pipeline_summary(img_arr: np.ndarray,
     axes[3].axis("off")
 
     plt.tight_layout()
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 8. Interactive 3-D colon mask (plotly)
+# ---------------------------------------------------------------------------
+
+def plot_colon_mask_3d(mask_arr: np.ndarray,
+                       spacing: tuple = (1.0, 1.0, 1.0),
+                       centerline: dict | None = None,
+                       step_size: int = 2,
+                       opacity: float = 0.5):
+    """
+    Interactive 3-D surface rendering of the colon mask using marching cubes.
+
+    Parameters
+    ----------
+    mask_arr   : (Z, Y, X) binary array
+    spacing    : (z_mm, y_mm, x_mm) voxel spacing
+    centerline : if provided, overlays the centerline path
+    step_size  : marching-cubes step (larger = faster/coarser mesh)
+    opacity    : surface opacity (0–1)
+
+    Returns a plotly Figure — call .show() or display it in a notebook cell.
+    """
+    import plotly.graph_objects as go
+    from skimage.measure import marching_cubes
+
+    print("Running marching cubes on colon mask…")
+    verts, faces, _, _ = marching_cubes(
+        mask_arr.astype(np.float32), level=0.5, step_size=step_size
+    )
+
+    # convert voxel [Z,Y,X] to physical mm, plot in standard [X,Y,Z] orientation
+    x_mm = verts[:, 2] * spacing[2]
+    y_mm = verts[:, 1] * spacing[1]
+    z_mm = verts[:, 0] * spacing[0]
+
+    traces = [
+        go.Mesh3d(
+            x=x_mm, y=y_mm, z=z_mm,
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            intensity=z_mm,
+            colorscale="Turbo",
+            showscale=True,
+            colorbar=dict(title="Z (mm)", thickness=12),
+            opacity=opacity,
+            name="Colon surface",
+            hoverinfo="skip",
+            flatshading=False,
+            lighting=dict(ambient=0.4, diffuse=0.7, specular=0.2, roughness=0.5),
+            lightposition=dict(x=100, y=200, z=500),
+        )
+    ]
+
+    if centerline is not None:
+        pts = np.array([p["coordinate"] for p in centerline["point"]])
+        traces.append(go.Scatter3d(
+            x=pts[:, 2] * spacing[2],
+            y=pts[:, 1] * spacing[1],
+            z=pts[:, 0] * spacing[0],
+            mode="lines",
+            line=dict(color="red", width=4),
+            name="Centerline",
+        ))
+        for idx, label, color in [(0, "Start", "lime"), (-1, "End", "crimson")]:
+            traces.append(go.Scatter3d(
+                x=[pts[idx, 2] * spacing[2]],
+                y=[pts[idx, 1] * spacing[1]],
+                z=[pts[idx, 0] * spacing[0]],
+                mode="markers+text",
+                marker=dict(size=6, color=color),
+                text=[label], textposition="top center",
+                name=label,
+            ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=dict(text="3-D Colon Mask — interactive (drag to rotate)", font=dict(size=16)),
+        scene=dict(
+            xaxis_title="X (mm)",
+            yaxis_title="Y (mm)",
+            zaxis_title="Z (mm)",
+            aspectmode="data",
+            bgcolor="rgb(10,10,20)",
+            xaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey"),
+            yaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey"),
+            zaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey"),
+        ),
+        paper_bgcolor="rgb(15,15,25)",
+        font=dict(color="white"),
+        legend=dict(bgcolor="rgba(0,0,0,0.4)", font=dict(color="white")),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=650,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 9. Interactive 3-D straightened colon (plotly)
+# ---------------------------------------------------------------------------
+
+def plot_straightened_3d(straight_img: np.ndarray,
+                         straight_seg: np.ndarray | None = None,
+                         n_clip_planes: int = 12,
+                         opacity_vol: float = 0.18,
+                         opacity_seg: float = 0.6):
+    """
+    Interactive 3-D view of the straightened colon.
+
+    Shows semi-transparent CT cross-section planes stacked along the arc axis,
+    plus the surface mesh of the straightened mask.
+
+    Parameters
+    ----------
+    straight_img   : (L, H, W) straightened CT (int16)
+    straight_seg   : (L, H, W) straightened binary mask (uint8), optional
+    n_clip_planes  : number of CT cross-section planes to display
+    opacity_vol    : opacity of CT slice planes
+    opacity_seg    : opacity of mask surface
+
+    Returns a plotly Figure.
+    """
+    import plotly.graph_objects as go
+    from skimage.measure import marching_cubes
+
+    L, H, W = straight_img.shape
+    traces = []
+
+    # --- CT cross-section planes stacked along arc axis ---
+    indices = np.linspace(0, L - 1, n_clip_planes, dtype=int)
+    lo, hi = np.percentile(straight_img, [2, 98])
+    x_grid, y_grid = np.meshgrid(np.arange(W), np.arange(H))
+
+    for idx in indices:
+        sl = np.clip(straight_img[idx].astype(float), lo, hi)
+        sl = (sl - lo) / (hi - lo + 1e-8)
+        traces.append(go.Surface(
+            x=x_grid, y=y_grid,
+            z=np.full_like(x_grid, idx, dtype=float),
+            surfacecolor=sl,
+            colorscale="Gray",
+            showscale=False,
+            opacity=opacity_vol,
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+    # --- straightened mask surface ---
+    if straight_seg is not None:
+        verts, faces, _, _ = marching_cubes(
+            straight_seg.astype(np.float32), level=0.5, step_size=2
+        )
+        # verts axes: [0]=arc(L), [1]=cross-Y(H), [2]=cross-X(W)
+        traces.append(go.Mesh3d(
+            x=verts[:, 2], y=verts[:, 1], z=verts[:, 0],
+            i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
+            color="mediumturquoise",
+            opacity=opacity_seg,
+            name="Colon wall",
+            flatshading=False,
+            lighting=dict(ambient=0.5, diffuse=0.7, specular=0.3, roughness=0.4),
+            lightposition=dict(x=W // 2, y=-200, z=L),
+        ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        title=dict(
+            text="3-D Straightened Colon — arc runs along Z axis",
+            font=dict(size=16),
+        ),
+        scene=dict(
+            xaxis_title="Cross-section X (vx)",
+            yaxis_title="Cross-section Y (vx)",
+            zaxis_title="Arc position (slice)",
+            aspectmode="data",
+            bgcolor="rgb(10,10,20)",
+            xaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey", range=[0, W]),
+            yaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey", range=[0, H]),
+            zaxis=dict(backgroundcolor="rgb(20,20,30)", gridcolor="grey"),
+            camera=dict(eye=dict(x=2.0, y=2.0, z=0.8)),
+        ),
+        paper_bgcolor="rgb(15,15,25)",
+        font=dict(color="white"),
+        legend=dict(bgcolor="rgba(0,0,0,0.4)", font=dict(color="white")),
+        margin=dict(l=0, r=0, t=40, b=0),
+        height=700,
+    )
     return fig
