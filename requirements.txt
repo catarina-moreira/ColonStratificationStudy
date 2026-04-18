@@ -26,9 +26,12 @@ tqdm_pathos>=0.4
 
 # Visualisation
 matplotlib>=3.7
+plotly>=1.0
 
 # Jupyter notebook
 jupyter>=1.0
 notebook>=7.0
 ipykernel>=6.0
 ipywidgets>=8.0
+
+
