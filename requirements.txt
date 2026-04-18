@@ -1,0 +1,34 @@
+# SATO colon straightening pipeline
+# Tested on Python 3.13 / macOS arm64 (April 2025)
+#
+# Install:
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r requirements.txt
+
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+
+# Medical image I/O
+SimpleITK>=2.3
+
+# Deep learning (CPU-only; omit --index-url for GPU builds)
+torch>=2.0
+torchvision>=0.15
+
+# Segmentation model
+TotalSegmentator>=2.0
+
+# Parallel straightening (optional, used by parallel_straighten.py)
+tqdm_pathos>=0.4
+
+# Visualisation
+matplotlib>=3.7
+
+# Jupyter notebook
+jupyter>=1.0
+notebook>=7.0
+ipykernel>=6.0
+ipywidgets>=8.0
